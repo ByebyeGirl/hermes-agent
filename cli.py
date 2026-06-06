@@ -3248,9 +3248,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Show token usage and cache hit info in the status bar
         self._show_cost = CLI_CONFIG["display"].get("show_cost", False)
 
-        # DeepSeek balance cache (lazy, one-shot per session)
+        # DeepSeek balance cache (lazy, throttled — min 30s between fetches)
         self._deepseek_balance_info = None
-        self._balance_fetch_attempted = False
+        self._balance_last_fetch_time = 0.0
 
         # Streaming display state
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
@@ -3847,10 +3847,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         return f"✓ {format_duration_compact(idle)}"
 
     def _fetch_deepseek_balance(self):
-        """Fetch DeepSeek account balance (one-shot per session)."""
-        if self._balance_fetch_attempted:
+        """Fetch DeepSeek account balance (throttled — min 30s between fetches)."""
+        now = time.time()
+        if self._balance_last_fetch_time and (now - self._balance_last_fetch_time) < 30:
             return
-        self._balance_fetch_attempted = True
+        self._balance_last_fetch_time = now
         try:
             import urllib.request
             import json
@@ -13113,6 +13114,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # Regular chat - run agent
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
+
+                    # Start periodic status bar refresh during agent execution
+                    # so cache-hit rate and balance updates are visible mid-turn
+                    def _status_bar_pumper():
+                        while self._agent_running:
+                            time.sleep(2)
+                            if self._agent_running:
+                                try:
+                                    app.invalidate()
+                                except Exception:
+                                    pass
+                    threading.Thread(target=_status_bar_pumper, daemon=True).start()
 
                     try:
                         self.chat(user_input, images=submit_images or None)
