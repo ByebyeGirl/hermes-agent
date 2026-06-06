@@ -96,6 +96,12 @@ def CanonicalUsage(*args, **kwargs):
     return _CanonicalUsage(*args, **kwargs)
 
 
+def currency_symbol(*args, **kwargs):
+    from agent.usage_pricing import currency_symbol as _currency_symbol
+
+    return _currency_symbol(*args, **kwargs)
+
+
 def estimate_usage_cost(*args, **kwargs):
     from agent.usage_pricing import estimate_usage_cost as _estimate_usage_cost
 
@@ -157,6 +163,7 @@ def realign_markdown_tables(*args, **kwargs):
     from agent.markdown_tables import realign_markdown_tables as _realign_markdown_tables
 
     return _realign_markdown_tables(*args, **kwargs)
+
 # NOTE: `from agent.account_usage import ...` is deliberately NOT at module
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
@@ -3238,6 +3245,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.user_message_preview_first_lines = max(1, _ump_first_lines)
         self.user_message_preview_last_lines = max(0, _ump_last_lines)
 
+        # Show token usage and cache hit info in the status bar
+        self._show_cost = CLI_CONFIG["display"].get("show_cost", False)
+
+        # DeepSeek balance cache (lazy, one-shot per session)
+        self._deepseek_balance_info = None
+        self._balance_fetch_attempted = False
+
         # Streaming display state
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
@@ -3689,11 +3703,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         startup UI and ``_replay_output_history`` cannot reconstruct it
         (the banner was never added to ``_OUTPUT_HISTORY``).
 
-        Instead we just reset prompt_toolkit's renderer cache so the next
-        incremental redraw starts from a clean slate, then let
-        ``original_on_resize`` recalculate layout for the new size.
+        We rely on prompt_toolkit's ``_on_resize`` (``original_on_resize``)
+        to handle the full recovery: it calls ``renderer.erase()`` which
+        moves to the correct cursor position, erases from there down, calls
+        ``renderer.reset()`` to drop the internal screen cache, then
+        requests CPR and redraws.  We must NOT call ``renderer.reset()``
+        ourselves before ``original_on_resize`` — doing so resets
+        ``_cursor_pos`` to ``(0, 0)`` (top of terminal instead of top of
+        prompt_toolkit region), causing the subsequent render to output at
+        the wrong position.  That corrupts terminal scrollback and produces
+        the visible "history scrolling from the beginning" effect (#22999).
 
-        We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
+        We flag ``_status_bar_suppressed_after_resize`` so the dynamic
         status bar and input separator rules stay hidden until the next user
         input.  On column shrink the terminal reflows already-rendered status
         bar rows into scrollback before prompt_toolkit can erase them; drawing
@@ -3702,14 +3723,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         next prompt restores the bar cleanly.
         """
         self._status_bar_suppressed_after_resize = True
-        try:
-            app.renderer.reset(leave_alternate_screen=False)
-        except Exception:
-            pass
-        try:
-            app.invalidate()
-        except Exception:
-            pass
         original_on_resize()
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
@@ -3833,6 +3846,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         idle = max(0.0, time.time() - last_finished_at)
         return f"✓ {format_duration_compact(idle)}"
 
+    def _fetch_deepseek_balance(self):
+        """Fetch DeepSeek account balance (one-shot per session)."""
+        if self._balance_fetch_attempted:
+            return
+        self._balance_fetch_attempted = True
+        try:
+            import urllib.request
+            import json
+            api_key = getattr(self, "api_key", None) or os.getenv("DEEPSEEK_API_KEY", "")
+            if not api_key:
+                return
+            base_url = getattr(self, "base_url", "") or ""
+            if "deepseek" not in base_url and self.provider != "deepseek":
+                return
+            req = urllib.request.Request(
+                "https://api.deepseek.com/user/balance",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                if data.get("is_available"):
+                    balance_infos = data.get("balance_infos", [])
+                    if balance_infos:
+                        info = balance_infos[0]
+                        self._deepseek_balance_info = {
+                            "currency": info.get("currency", "CNY"),
+                            "total_balance": info.get("total_balance", "0"),
+                            "topped_up_balance": info.get("topped_up_balance", "0"),
+                            "granted_balance": info.get("granted_balance", "0"),
+                        }
+        except Exception:
+            pass  # Balance fetch is best-effort
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -3925,6 +3971,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+
+        # Session cost estimate (when show_cost is on)
+        if self._show_cost:
+            try:
+                cost_result = estimate_usage_cost(
+                    model_name,
+                    CanonicalUsage(
+                        input_tokens=snapshot["session_input_tokens"],
+                        output_tokens=snapshot["session_output_tokens"],
+                        cache_read_tokens=snapshot["session_cache_read_tokens"],
+                        cache_write_tokens=snapshot["session_cache_write_tokens"],
+                    ),
+                    provider=getattr(agent, "provider", None) if agent else None,
+                    base_url=getattr(agent, "base_url", None) if agent else None,
+                )
+                snapshot["session_cost_usd"] = cost_result.amount_usd
+                snapshot["session_cost_status"] = cost_result.status
+                snapshot["session_cost_currency"] = cost_result.currency
+            except Exception:
+                snapshot["session_cost_usd"] = None
+                snapshot["session_cost_status"] = "error"
+
+            # DeepSeek balance (one-shot lazy fetch)
+            self._fetch_deepseek_balance()
+            if self._deepseek_balance_info:
+                snapshot["deepseek_balance"] = self._deepseek_balance_info
 
         return snapshot
 
@@ -4231,6 +4303,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                     ])
+                    # Token / cache display (compact) when show_cost is on
+                    if self._show_cost and snapshot.get("session_total_tokens"):
+                        _input_t = snapshot.get("session_input_tokens", 0)
+                        _total_t = snapshot["session_total_tokens"]
+                        _input_s = format_token_count_compact(_input_t)
+                        _total_s = format_token_count_compact(_total_t)
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-cost", f"\U0001f4ca{_input_s}/{_total_s}"))
+                        _cost = snapshot.get("session_cost_usd")
+                        if _cost is not None:
+                            _cur = snapshot.get("session_cost_currency", "USD") or "USD"
+                            _sym = currency_symbol(_cur)
+                            _bal = snapshot.get("deepseek_balance")
+                            frags.append(("class:status-bar-dim", " · "))
+                            if _bal:
+                                _total_bal = _bal.get("total_balance", "0")
+                                frags.append(("class:status-bar-cost", f"\U0001f4b0{_sym}{_cost:.4f}/{_sym}{_total_bal}"))
+                            else:
+                                frags.append(("class:status-bar-cost", f"\U0001f4b0{_sym}{_cost:.4f}"))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -4270,6 +4361,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                     ])
+                    # Token / cache hit display when show_cost is on
+                    if self._show_cost:
+                        _total = snapshot.get("session_total_tokens", 0)
+                        _cache = snapshot.get("session_cache_read_tokens", 0)
+                        _input = snapshot.get("session_input_tokens", 0)
+                        _calls = snapshot.get("session_api_calls", 0)
+                        if _total:
+                            _input_s = format_token_count_compact(_input)
+                            _total_s = format_token_count_compact(_total)
+                            frags.append(("class:status-bar-dim", " │ "))
+                            frags.append(("class:status-bar-cost", f"📊{_input_s}/{_total_s}"))
+                            if _cache and _input:
+                                _pct = min(100, round((_cache / max(1, _input)) * 100))
+                                _cache_s = format_token_count_compact(_cache)
+                                frags.append(("class:status-bar-dim", " · "))
+                                frags.append(("class:status-bar-cost", f"💾{_cache_s}({_pct}%)"))
+                            if _calls:
+                                frags.append(("class:status-bar-dim", " · "))
+                                frags.append(("class:status-bar-cost", f"📞{_calls}"))
+                            # Session cost — use model's actual billing currency
+                            _cost = snapshot.get("session_cost_usd")
+                            _cur = snapshot.get("session_cost_currency", "USD") or "USD"
+                            _sym = currency_symbol(_cur)
+                            _bal = snapshot.get("deepseek_balance")
+                            if _cost is not None or _bal:
+                                frags.append(("class:status-bar-dim", " · "))
+                                if _cost is not None and _bal:
+                                    _total_bal = _bal.get("total_balance", "0")
+                                    frags.append(("class:status-bar-cost", f"💰{_sym}{_cost:.4f}/{_sym}{_total_bal}"))
+                                elif _cost is not None:
+                                    frags.append(("class:status-bar-cost", f"💰{_sym}{_cost:.4f}"))
+                                elif _bal:
+                                    _total_bal = _bal.get("total_balance", "0")
+                                    frags.append(("class:status-bar-cost", f"💳{_sym}{_total_bal}"))
                     # Position 7: per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
                     if prompt_elapsed:
@@ -8279,7 +8404,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         print(f"  Cost source:              {cost_result.source:>10}")
         if cost_result.amount_usd is not None:
             prefix = "~" if cost_result.status == "estimated" else ""
-            print(f"  Total cost:              {prefix}${float(cost_result.amount_usd):>10.4f}")
+            _cur = getattr(cost_result, "currency", "USD") or "USD"
+            _sym = currency_symbol(_cur)
+            print(f"  Total cost:              {prefix}{_sym}{float(cost_result.amount_usd):>10.4f}")
         elif cost_result.status == "included":
             print(f"  Total cost:              {'included':>10}")
         else:

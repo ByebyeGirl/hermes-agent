@@ -229,6 +229,7 @@ export interface SessionUsageResponse {
   context_percent?: number
   context_used?: number
   cost_status?: 'estimated' | 'exact'
+  cost_currency?: string
   cost_usd?: number
   credits_lines?: string[]
   input?: number

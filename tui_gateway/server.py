@@ -2226,7 +2226,7 @@ def _get_usage(agent) -> dict:
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     try:
-        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        from agent.usage_pricing import CanonicalUsage, currency_symbol, estimate_usage_cost
 
         cost = estimate_usage_cost(
             usage["model"],
@@ -2240,6 +2240,7 @@ def _get_usage(agent) -> dict:
             base_url=getattr(agent, "base_url", None),
         )
         usage["cost_status"] = cost.status
+        usage["cost_currency"] = getattr(cost, "currency", "USD") or "USD"
         if cost.amount_usd is not None:
             usage["cost_usd"] = float(cost.amount_usd)
     except Exception:

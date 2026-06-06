@@ -78,7 +78,7 @@ class TestUsageCachedAgent:
 
         with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
              patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=0.1234, status="estimated")
+            mock_cost.return_value = MagicMock(amount_usd=0.1234, status="estimated", currency="USD")
             result = await runner._handle_usage_command(event)
 
         assert "claude-sonnet-4.6" in result

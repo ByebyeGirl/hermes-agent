@@ -173,6 +173,7 @@ export interface Usage {
   context_percent?: number
   context_used?: number
   cost_status?: string
+  cost_currency?: string
   cost_usd?: number
   dev_credits_spent_micros?: number
   input: number

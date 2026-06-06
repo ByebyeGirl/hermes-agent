@@ -15,6 +15,19 @@ _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 
+# Map ISO 4217 currency codes to display symbols
+_CURRENCY_SYMBOLS: Dict[str, str] = {
+    "USD": "$",
+    "CNY": "¥",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+}
+
+def currency_symbol(currency_code: str) -> str:
+    """Return the display symbol for an ISO 4217 currency code."""
+    return _CURRENCY_SYMBOLS.get(currency_code, currency_code)
+
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
     "provider_cost_api",
@@ -65,6 +78,7 @@ class PricingEntry:
     source_url: Optional[str] = None
     pricing_version: Optional[str] = None
     fetched_at: Optional[datetime] = None
+    currency: str = "USD"  # ISO 4217 currency code — "CNY" for DeepSeek, "USD" for most others
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,7 @@ class CostResult:
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
+    currency: str = "USD"  # ISO 4217 — "CNY" for DeepSeek, "USD" for most others
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)
@@ -388,6 +403,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-03-16",
+        currency="CNY",
     ),
     (
         "deepseek",
@@ -398,6 +414,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-03-16",
+        currency="CNY",
     ),
     (
         "deepseek",
@@ -409,6 +426,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-05-12",
+        currency="CNY",
     ),
     # Google Gemini
     (
@@ -795,13 +813,16 @@ def estimate_usage_cost(
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
 
+    entry_currency = getattr(entry, "currency", "USD") or "USD"
+    cur_sym = currency_symbol(entry_currency)
+
     notes: list[str] = []
     amount = _ZERO
 
     if usage.input_tokens and entry.input_cost_per_million is None:
-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a", currency=entry_currency)
     if usage.output_tokens and entry.output_cost_per_million is None:
-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a", currency=entry_currency)
     if usage.cache_read_tokens:
         if entry.cache_read_cost_per_million is None:
             return CostResult(
@@ -810,6 +831,7 @@ def estimate_usage_cost(
                 source=entry.source,
                 label="n/a",
                 notes=("cache-read pricing unavailable for route",),
+                currency=entry_currency,
             )
     if usage.cache_write_tokens:
         if entry.cache_write_cost_per_million is None:
@@ -819,6 +841,7 @@ def estimate_usage_cost(
                 source=entry.source,
                 label="n/a",
                 notes=("cache-write pricing unavailable for route",),
+                currency=entry_currency,
             )
 
     if entry.input_cost_per_million is not None:
@@ -833,7 +856,7 @@ def estimate_usage_cost(
         amount += Decimal(usage.request_count) * entry.request_cost
 
     status: CostStatus = "estimated"
-    label = f"~${amount:.2f}"
+    label = f"~{cur_sym}{amount:.2f}"
     if entry.source == "none" and amount == _ZERO:
         status = "included"
         label = "included"
@@ -849,6 +872,7 @@ def estimate_usage_cost(
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
+        currency=entry_currency,
     )
 
 
